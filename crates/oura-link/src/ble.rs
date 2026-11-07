@@ -37,6 +37,16 @@ pub struct BleTransport {
     _pump: tokio::task::JoinHandle<()>,
 }
 
+/// Start an unfiltered scan; callers check `OURA_SERVICE` on each peripheral.
+///
+/// With a BlueZ discovery filter on the service UUID (`ScanFilter { services }`),
+/// a factory-reset Ring 3 that advertised the UUID was never reported; an
+/// unfiltered scan on the same adapter reported it.
+async fn start_unfiltered_scan(adapter: &btleplug::platform::Adapter) -> Result<()> {
+    adapter.start_scan(ScanFilter::default()).await?;
+    Ok(())
+}
+
 async fn first_adapter() -> Result<btleplug::platform::Adapter> {
     let manager = Manager::new().await?;
     manager
@@ -69,11 +79,7 @@ pub fn name_matches(advertised: &str, needle: &str) -> bool {
 /// substring. Returns candidates sorted by signal strength (strongest first).
 pub async fn scan(name_contains: &str, timeout: Duration) -> Result<Vec<Discovered>> {
     let adapter = first_adapter().await?;
-    adapter
-        .start_scan(ScanFilter {
-            services: vec![protocol::OURA_SERVICE],
-        })
-        .await?;
+    start_unfiltered_scan(&adapter).await?;
 
     let deadline = Instant::now() + timeout;
     let mut found: Vec<Discovered> = Vec::new();
@@ -121,11 +127,7 @@ impl BleTransport {
         scan_timeout: Duration,
     ) -> Result<Self> {
         let adapter = first_adapter().await?;
-        adapter
-            .start_scan(ScanFilter {
-                services: vec![protocol::OURA_SERVICE],
-            })
-            .await?;
+        start_unfiltered_scan(&adapter).await?;
 
         let deadline = Instant::now() + scan_timeout;
         let mut chosen: Option<(Peripheral, i16)> = None;
@@ -158,9 +160,11 @@ impl BleTransport {
                 break;
             }
         }
-        let _ = adapter.stop_scan().await;
 
-        let (peripheral, _) = chosen.ok_or(Error::DeviceNotFound)?;
+        let Some((peripheral, _)) = chosen else {
+            let _ = adapter.stop_scan().await;
+            return Err(Error::DeviceNotFound);
+        };
 
         // CoreBluetooth's connect (and, on some stacks, service discovery) has no
         // deadline of its own: a ring that advertises but won't complete the GATT
@@ -190,8 +194,14 @@ impl BleTransport {
             }
             Ok::<_, Error>(write_char)
         })
-        .await
-        .map_err(|_| Error::ConnectTimeout)??;
+        .await;
+        // Keep discovery running until the link is up. On Linux, connecting to a
+        // bonded ring (which advertises a resolvable private address) with
+        // discovery stopped hands RPA resolution to the controller; an Intel
+        // controller was observed never to match the ring, so the connect timed
+        // out. With active discovery running, the kernel resolves the RPA itself.
+        let _ = adapter.stop_scan().await;
+        let write_char = write_char.map_err(|_| Error::ConnectTimeout)??;
 
         let (tx, _) = broadcast::channel(256);
         let pump_tx = tx.clone();
