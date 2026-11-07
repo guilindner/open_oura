@@ -161,6 +161,9 @@ pub async fn scan(name_contains: &str, timeout: Duration) -> Result<Vec<Discover
             if !name_matches(&name, name_contains) {
                 continue;
             }
+            let Some(rssi) = props.rssi else {
+                continue;
+            };
             let id = p.id().to_string();
             let entry = Discovered {
                 id: id.clone(),
@@ -169,7 +172,7 @@ pub async fn scan(name_contains: &str, timeout: Duration) -> Result<Vec<Discover
                 } else {
                     name
                 },
-                rssi: props.rssi.unwrap_or(i16::MIN),
+                rssi,
             };
             match found.iter_mut().find(|d| d.id == id) {
                 Some(existing) => *existing = entry,
@@ -210,11 +213,15 @@ impl BleTransport {
                     continue;
                 }
                 if let Some(addr) = address {
-                    if !p.id().to_string().eq_ignore_ascii_case(addr) {
+                    let pid = p.id().to_string();
+                    let bda = props.address.to_string();
+                    if !pid.eq_ignore_ascii_case(addr) && !bda.eq_ignore_ascii_case(addr) {
                         continue;
                     }
                 }
-                let rssi = props.rssi.unwrap_or(i16::MIN);
+                let Some(rssi) = props.rssi else {
+                    continue;
+                };
                 if chosen.as_ref().map(|(_, r)| rssi > *r).unwrap_or(true) {
                     chosen = Some((p, rssi));
                 }
@@ -238,7 +245,11 @@ impl BleTransport {
         // an actionable error instead of blocking indefinitely.
         let write_char = tokio::time::timeout(CONNECT_TIMEOUT, async {
             if !peripheral.is_connected().await? {
-                peripheral.connect().await?;
+                if let Err(e) = peripheral.connect().await {
+                    tracing::warn!("first connect failed: {e}; retrying in 1s...");
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    peripheral.connect().await?;
+                }
             }
 
             let (write_char, notify_chars) = resolve_oura_characteristics(
@@ -250,7 +261,9 @@ impl BleTransport {
             .await?;
 
             for c in &notify_chars {
-                peripheral.subscribe(c).await?;
+                if let Err(e) = peripheral.subscribe(c).await {
+                    tracing::warn!("subscribing to {} returned {e} (ignoring)", c.uuid);
+                }
             }
             Ok::<_, Error>(write_char)
         })
