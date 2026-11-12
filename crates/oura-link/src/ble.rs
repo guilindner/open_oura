@@ -27,6 +27,58 @@ pub const SERVICES_RESOLVED_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Polling interval for retrying service discovery while services resolve.
 pub const SERVICES_RESOLVED_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Upper bound on a single GATT write-with-response. One write is a single ATT
+/// round-trip, normally well under a second. If the link drops silently, the
+/// response never arrives and the platform never fails the call
+/// (https://github.com/Th0rgal/open_oura/issues/40).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on a disconnect request, for the same reason as [`WRITE_TIMEOUT`].
+pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Selection rank given to a ring that is already connected to this host.
+///
+/// A connected peripheral stops advertising, so BlueZ reports no RSSI for it.
+/// It is the ring we are most certain to reach, so it outranks any advertiser
+/// (real RSSI values are negative dBm).
+pub const CONNECTED_RANK: i16 = i16::MAX;
+
+/// Rank an Oura peripheral for selection, or `None` if it is not reachable.
+///
+/// An advertiser ranks by RSSI. A peripheral that is already connected to this
+/// host (for example, a link left open by an earlier process that was killed
+/// mid-sync) does not advertise and has no RSSI. Skipping it made the ring
+/// unreachable until the link was dropped by hand. It gets [`CONNECTED_RANK`].
+/// A device that is only in the platform cache (bonded, but neither advertising
+/// nor connected) is skipped.
+pub(crate) fn candidate_rank(rssi: Option<i16>, connected: bool) -> Option<i16> {
+    match (rssi, connected) {
+        (Some(rssi), _) => Some(rssi),
+        (None, true) => Some(CONNECTED_RANK),
+        (None, false) => None,
+    }
+}
+
+/// Run a BLE call with a deadline, mapping expiry to `on_timeout`.
+async fn bounded<T>(
+    limit: Duration,
+    on_timeout: Error,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, call)
+        .await
+        .unwrap_or(Err(on_timeout))
+}
+
+/// RSSI plus connection state for an Oura peripheral, resolved to a selection rank.
+///
+/// `is_connected` is only queried when there is no RSSI, so the common
+/// advertising case costs no extra platform call.
+async fn peripheral_rank(p: &Peripheral, rssi: Option<i16>) -> Option<i16> {
+    let connected = rssi.is_none() && p.is_connected().await.unwrap_or(false);
+    candidate_rank(rssi, connected)
+}
+
 /// Resolve the Oura service write characteristic and notification characteristics,
 /// retrying service discovery until GATT resolution finishes or `timeout` expires.
 ///
@@ -88,7 +140,11 @@ where
 pub struct Discovered {
     pub id: String,
     pub name: String,
+    /// Advertised signal strength in dBm. Meaningless when `connected` is true:
+    /// a connected ring does not advertise, and this holds [`CONNECTED_RANK`].
     pub rssi: i16,
+    /// Already connected to this host, so not advertising.
+    pub connected: bool,
 }
 
 /// A connected BLE link to a ring. Notifications from every notify/indicate
@@ -161,7 +217,7 @@ pub async fn scan(name_contains: &str, timeout: Duration) -> Result<Vec<Discover
             if !name_matches(&name, name_contains) {
                 continue;
             }
-            let Some(rssi) = props.rssi else {
+            let Some(rank) = peripheral_rank(&p, props.rssi).await else {
                 continue;
             };
             let id = p.id().to_string();
@@ -172,7 +228,8 @@ pub async fn scan(name_contains: &str, timeout: Duration) -> Result<Vec<Discover
                 } else {
                     name
                 },
-                rssi,
+                rssi: rank,
+                connected: props.rssi.is_none(),
             };
             match found.iter_mut().find(|d| d.id == id) {
                 Some(existing) => *existing = entry,
@@ -219,11 +276,17 @@ impl BleTransport {
                         continue;
                     }
                 }
-                let Some(rssi) = props.rssi else {
+                let Some(rank) = peripheral_rank(&p, props.rssi).await else {
                     continue;
                 };
-                if chosen.as_ref().map(|(_, r)| rssi > *r).unwrap_or(true) {
-                    chosen = Some((p, rssi));
+                if rank == CONNECTED_RANK {
+                    tracing::info!(
+                        "ring {} is already connected to this host; reusing the link",
+                        p.id()
+                    );
+                }
+                if chosen.as_ref().map(|(_, r)| rank > *r).unwrap_or(true) {
+                    chosen = Some((p, rank));
                 }
             }
             if chosen.is_some() {
@@ -298,18 +361,24 @@ impl BleTransport {
 
     /// Disconnect from the ring.
     pub async fn disconnect(&self) -> Result<()> {
-        self.peripheral.disconnect().await?;
-        Ok(())
+        bounded(DISCONNECT_TIMEOUT, Error::DisconnectTimeout, async {
+            self.peripheral.disconnect().await?;
+            Ok(())
+        })
+        .await
     }
 }
 
 #[async_trait::async_trait]
 impl Transport for BleTransport {
     async fn write(&self, data: &[u8]) -> Result<()> {
-        self.peripheral
-            .write(&self.write_char, data, WriteType::WithResponse)
-            .await?;
-        Ok(())
+        bounded(WRITE_TIMEOUT, Error::WriteTimeout, async {
+            self.peripheral
+                .write(&self.write_char, data, WriteType::WithResponse)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
@@ -341,6 +410,57 @@ mod tests {
     fn empty_needle_matches_everything() {
         assert!(name_matches("", ""));
         assert!(name_matches("anything", "  "));
+    }
+
+    #[test]
+    fn advertising_ring_ranks_by_rssi() {
+        assert_eq!(candidate_rank(Some(-60), false), Some(-60));
+        // A fresh RSSI wins even if the platform also reports it connected.
+        assert_eq!(candidate_rank(Some(-60), true), Some(-60));
+    }
+
+    #[test]
+    fn connected_ring_without_rssi_is_still_a_candidate() {
+        // A ring already linked to this host stops advertising, so BlueZ has no
+        // RSSI for it. It must still be selectable, ahead of any advertiser.
+        assert_eq!(candidate_rank(None, true), Some(CONNECTED_RANK));
+        assert!(CONNECTED_RANK > 0);
+    }
+
+    #[test]
+    fn stale_cache_entry_is_not_a_candidate() {
+        // Known to BlueZ (bonded) but neither advertising nor connected.
+        assert_eq!(candidate_rank(None, false), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_passes_through_a_result_that_arrives_in_time() {
+        let ok = bounded(Duration::from_millis(100), Error::WriteTimeout, async {
+            Ok::<_, Error>(7)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ok, 7);
+
+        let err = bounded(Duration::from_millis(100), Error::WriteTimeout, async {
+            Err::<(), _>(Error::Ble("gatt error".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Ble(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_turns_a_hung_call_into_the_given_error() {
+        // A silently dropped link never answers a GATT write (issue #40).
+        let err = bounded(
+            Duration::from_millis(20),
+            Error::WriteTimeout,
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::WriteTimeout));
     }
 
     fn mock_characteristic(

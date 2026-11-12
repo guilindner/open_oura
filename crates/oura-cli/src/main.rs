@@ -476,7 +476,11 @@ async fn cmd_scan(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     for d in found {
-        println!("{:>5} dBm  {}  ({})", d.rssi, d.name, d.id);
+        if d.connected {
+            println!("connected  {}  ({})", d.name, d.id);
+        } else {
+            println!("{:>5} dBm  {}  ({})", d.rssi, d.name, d.id);
+        }
     }
     Ok(())
 }

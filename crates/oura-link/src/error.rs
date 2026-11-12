@@ -13,6 +13,10 @@ pub enum Error {
     ConnectTimeout,
     #[error("characteristic not found: {0}")]
     CharacteristicNotFound(String),
+    #[error("timed out waiting for the ring to acknowledge a write (link dropped?)")]
+    WriteTimeout,
+    #[error("timed out disconnecting from the ring")]
+    DisconnectTimeout,
     #[error("authentication failed: {0}")]
     Auth(String),
     #[error("protocol error: {0}")]
@@ -32,7 +36,10 @@ impl Error {
     /// Whether this error represents a connection or service discovery condition
     /// that is potentially retryable.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::ConnectTimeout | Error::CharacteristicNotFound(_))
+        matches!(
+            self,
+            Error::ConnectTimeout | Error::CharacteristicNotFound(_) | Error::WriteTimeout
+        )
     }
 }
 
@@ -46,6 +53,9 @@ mod tests {
         assert!(Error::CharacteristicNotFound("dummy".into()).is_retryable());
         assert!(!Error::DeviceNotFound.is_retryable());
         assert!(!Error::Auth("bad key".into()).is_retryable());
+        // A write that never got a response means the link died: reconnecting may work.
+        assert!(Error::WriteTimeout.is_retryable());
+        assert!(!Error::DisconnectTimeout.is_retryable());
     }
 }
 
